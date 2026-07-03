@@ -1,16 +1,30 @@
+<<<<<<< HEAD
 {
   "cleanupPeriodDays": 99999,
   "env": {
+=======
+{
+  "cleanupPeriodDays": 99999,
+  "env": {
+>>>>>>> f8b1fd5f527b034281b342dbfbc17f9f085cd05c
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "DISABLE_ERROR_REPORTING": "1"
   },
   "effortLevel": "low",
   "skipDangerousModePermissionPrompt": false,
+<<<<<<< HEAD
   "theme": "dark",
   "reidcli": {
     "default_provider": "reidverse",
     "log_level": "INFO",
     "policy": {
+=======
+  "theme": "dark",
+  "reidcli": {
+    "default_provider": "reidverse",
+    "log_level": "INFO",
+    "policy": {
+>>>>>>> f8b1fd5f527b034281b342dbfbc17f9f085cd05c
       "default_mode": "balanced",
       "shell_timeout_seconds": 60
     }
