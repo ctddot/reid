@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# ReidCLI local state (do not commit)
+.reidcli/
+*.session.json
+*.tasks.json
+settings.local.json
+.env
+.env.*
+
+# Editor
+.vscode/
+.idea/
+.ruff_cache/

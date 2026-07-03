@@ -1,0 +1,18 @@
+{
+  "cleanupPeriodDays": 99999,
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_ERROR_REPORTING": "1"
+  },
+  "effortLevel": "low",
+  "skipDangerousModePermissionPrompt": false,
+  "theme": "dark",
+  "reidcli": {
+    "default_provider": "reidverse",
+    "log_level": "INFO",
+    "policy": {
+      "default_mode": "balanced",
+      "shell_timeout_seconds": 60
+    }
+  }
+}
