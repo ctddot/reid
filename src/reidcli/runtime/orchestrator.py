@@ -1,0 +1,293 @@
+"""Orchestrator: ties session + tasks + agent into a coherent runtime.
+
+Owns the lifetime of a session's runtime: starting, submitting tasks, resuming,
+and persisting transcript/events. The orchestrator is the single place where
+session, task, agent, and policy meet — UI and automation layers call into it.
+"""
+from __future__ import annotations
+
+from collections.abc import Callable
+from pathlib import Path
+
+from reidcli.config.models import Config
+from reidcli.diagnostics.logger import get_logger
+from reidcli.personas import Persona, PersonaStore
+from reidcli.policy.engine import PolicyEngine
+from reidcli.policy.models import PermissionMode
+from reidcli.provider.base import BaseProvider
+from reidcli.provider.registry import ProviderRegistry
+from reidcli.runtime.agent import BASE_SYSTEM_PROMPT, Agent
+from reidcli.runtime.state import RuntimeState
+from reidcli.session.models import Session, SessionStatus
+from reidcli.session.store import SessionStore
+from reidcli.tasks.models import TaskStatus
+from reidcli.tasks.store import TaskStore
+from reidcli.tools.base import Approver
+from reidcli.tools.registry import ToolRegistry
+from reidcli.workflows.store import WorkflowStore
+
+log = get_logger("reidcli.runtime")
+
+INTERACTION_MODES = ("plan", "accept_edits", "automation")
+MODE_DISABLED_TOOLS = {
+    "plan": {"write_file", "patch_file", "run_command"},
+    "accept_edits": set(),
+    "automation": set(),
+}
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        config: Config,
+        provider: BaseProvider,
+        tools: ToolRegistry,
+        providers: ProviderRegistry | None = None,
+    ) -> None:
+        self.config = config
+        self.provider = provider
+        self.tools = tools
+        self.providers = providers
+        self.policy = PolicyEngine(config)
+        self.session_store = SessionStore(config.storage_root or (Path.home() / ".reidcli"))
+        self.workflow_store = WorkflowStore(config.storage_root or (Path.home() / ".reidcli"))
+        self.persona_store = PersonaStore(config.storage_root or (Path.home() / ".reidcli"))
+        # Subagent runtime (spawn_agent tool + TUI panel subscribe to this).
+        # Imported lazily to avoid an import cycle: tools/spawn_agent constructs
+        # a child Agent using the registries held here.
+        from reidcli.runtime.subagent import SubagentManager  # noqa: PLC0415
+        self.subagents = SubagentManager()
+        self.agent = Agent(provider, tools, self.policy, context_extras={"orchestrator": self})
+        self.state: RuntimeState | None = None
+        self.nyx_enabled = False
+        self.active_persona: Persona | None = None
+        self.interaction_mode = "accept_edits"
+        self._task_store_cache: TaskStore | None = None
+        self._task_count_cache = 0
+        self._apply_interaction_mode()
+
+    def use_provider(self, name: str) -> BaseProvider:
+        """Session-scoped provider swap. Rebuilds the Agent so subsequent turns
+        route through the new provider. Persistent default (`config.default_provider`)
+        is intentionally NOT changed — stub stays default across restarts unless
+        explicitly asked via a future --set-default flag."""
+        if self.providers is None:
+            raise RuntimeError("no provider registry attached")
+        provider = self.providers.get(name)
+        self.provider = provider
+        self.agent = Agent(
+            provider,
+            self.tools,
+            self.policy,
+            base_system_prompt=self._base_system_prompt(),
+            context_extras={"orchestrator": self},
+        )
+        if self.state is not None:
+            self.state.session.provider = name
+            prov_cfg = self.config.providers.get(name)
+            if prov_cfg and prov_cfg.default_model:
+                self.state.session.model = prov_cfg.default_model
+            elif getattr(provider, "default_model", ""):
+                self.state.session.model = provider.default_model
+            self.session_store.update(self.state.session)
+        return provider
+
+    def start_session(self, title: str = "") -> Session:
+        workspace = (self.config.workspace_root or Path.cwd()).resolve()
+        session = Session(
+            title=title or "untitled",
+            workspace=workspace,
+            provider=self.config.default_provider,
+            model=self._default_model(),
+            permission_mode=self.config.policy.default_mode,
+        )
+        self.session_store.create(session)
+        self.state = RuntimeState(session=session)
+        self._task_store_cache = None
+        self._task_count_cache = 0
+        self.session_store.event_log(session.id).write("session_start", {"title": session.title})
+        return session
+
+    def _default_model(self) -> str:
+        prov = self.config.providers.get(self.config.default_provider)
+        if prov and prov.default_model:
+            return prov.default_model
+        if getattr(self.provider, "default_model", ""):
+            return self.provider.default_model
+        return "stub-v0"
+
+    def _base_system_prompt(self) -> str:
+        return self.active_persona.system_prompt if self.active_persona is not None else BASE_SYSTEM_PROMPT
+
+    def _apply_interaction_mode(self) -> None:
+        disabled = set(MODE_DISABLED_TOOLS.get(self.interaction_mode, set()))
+        self.disabled_tools = disabled
+        self.agent.context_extras["disabled_tools"] = disabled
+        self.agent.context_extras["plan_enabled"] = self.interaction_mode == "plan"
+        self.agent.context_extras["automation_enabled"] = self.interaction_mode == "automation"
+        if self.interaction_mode == "plan":
+            self.set_permission_mode(PermissionMode.STRICT)
+        else:
+            self.set_permission_mode(PermissionMode.AUTONOMOUS)
+
+    def set_interaction_mode(self, mode: str) -> str:
+        if mode not in INTERACTION_MODES:
+            raise ValueError(f"unknown interaction mode: {mode}")
+        self.interaction_mode = mode
+        self._apply_interaction_mode()
+        return self.interaction_mode
+
+    def cycle_interaction_mode(self) -> str:
+        idx = INTERACTION_MODES.index(self.interaction_mode)
+        return self.set_interaction_mode(INTERACTION_MODES[(idx + 1) % len(INTERACTION_MODES)])
+
+    def resume_session(self, session_id: str) -> Session:
+        session = self.session_store.get(session_id)
+        if session is None:
+            raise KeyError(f"session {session_id} not found")
+        self.session_store.set_status(session.id, SessionStatus.ACTIVE)
+        self.state = RuntimeState(session=session)
+        self.policy.set_mode(session.permission_mode)
+        # Restore prior transcript into in-memory state for real continuation.
+        self.state.messages = self.session_store.read_messages(session.id)
+        self._task_store_cache = None
+        self._task_count_cache = len(self.task_store().list())
+        self.session_store.event_log(session.id).write("session_resume", {"messages": len(self.state.messages)})
+        return session
+
+    def task_store(self) -> TaskStore:
+        if self.state is None:
+            raise RuntimeError("no active session")
+        if self._task_store_cache is None or self._task_store_cache.session_id != self.state.session.id:
+            self._task_store_cache = TaskStore(
+                self.config.storage_root or (Path.home() / ".reidcli"),
+                self.state.session.id,
+            )
+        return self._task_store_cache
+
+    def submit_task(
+        self,
+        user_input: str,
+        *,
+        approver: Approver | None = None,
+        title: str | None = None,
+        cancel: Callable[[], bool] | None = None,
+        activity: Callable[[str], None] | None = None,
+    ) -> dict:
+        """Run one user turn against the agent, tracking it as a Task.
+
+        `cancel`, if given, is forwarded to `Agent.run_turn` and polled at
+        safe points so a user-triggered stop (e.g. Escape in the TUI) ends
+        the turn with whatever partial answer/tool results it already has,
+        instead of running to completion.
+        """
+        if self.state is None:
+            raise RuntimeError("no active session; call start_session first")
+        store = self.task_store()
+        task = store.create(title or user_input[:60])
+        self._task_count_cache += 1
+        store.update_status(task.id, TaskStatus.ACTIVE)
+        self.state.active_task_id = task.id
+
+        # Record message count so we can persist only the new messages from this turn.
+        pre_turn_count = len(self.state.messages)
+        writable_roots = [r.resolve() for r in self.config.policy.additional_writable_roots]
+        final_text, tool_log = self.agent.run_turn(
+            self.state,
+            user_input,
+            writable_roots=writable_roots,
+            approver=approver,
+            cancel=cancel,
+            activity=activity,
+        )
+
+        # Persist new messages incrementally for restorable resume.
+        sid = self.state.session.id
+        for msg in self.state.messages[pre_turn_count:]:
+            self.session_store.append_message(sid, msg)
+
+        # Turn summary in events.jsonl (human-readable, separate from restorable transcript).
+        self.session_store.event_log(sid).write(
+            "task_complete", {"task_id": task.id, "tools": len(tool_log)}
+        )
+
+        # Derive task status from the turn outcome.
+        cancelled = final_text.startswith("[cancelled by user]")
+        exhausted = final_text.startswith("[agent] step budget exhausted")
+        all_tools_failed = bool(tool_log) and not any(entry["ok"] for entry in tool_log)
+        if cancelled:
+            store.update_status(task.id, TaskStatus.SKIPPED, summary=final_text[:200])
+        elif exhausted or all_tools_failed:
+            store.update_status(task.id, TaskStatus.FAILED, error=final_text[:200])
+        else:
+            store.update_status(task.id, TaskStatus.COMPLETED, summary=final_text[:200])
+        self.session_store.update(self.state.session)
+        return {
+            "task_id": task.id,
+            "text": final_text,
+            "tools": tool_log,
+            "thinking": self.state.last_thinking,
+        }
+
+    def list_tasks(self) -> list:
+        if self.state is None:
+            return []
+        tasks = self.task_store().list()
+        self._task_count_cache = len(tasks)
+        return tasks
+
+    def task_count(self) -> int:
+        return self._task_count_cache
+
+    def set_nyx(self, enabled: bool) -> None:
+        """Toggle Nyx persona. Tool registry and policy remain unchanged."""
+        self.set_persona("nyx" if enabled else "")
+
+    def set_persona(self, name: str) -> None:
+        key = name.strip().lower()
+        if not key or key in ("off", "none", "default"):
+            self.active_persona = None
+            self.nyx_enabled = False
+        else:
+            persona = self.persona_store.get(key)
+            if persona is None:
+                raise KeyError(f"persona not found: {key}")
+            self.active_persona = persona
+            self.nyx_enabled = persona.name == "nyx"
+        self.agent = Agent(
+            self.provider,
+            self.tools,
+            self.policy,
+            base_system_prompt=self._base_system_prompt(),
+            context_extras={"orchestrator": self},
+        )
+        self._apply_interaction_mode()
+
+    def set_permission_mode(self, mode) -> None:  # type: ignore[no-untyped-def]
+        # Single source of truth: update policy engine + session + persist.
+        self.policy.set_mode(mode)
+        if self.state is None:
+            self.config.policy.default_mode = mode
+            return
+        self.state.session.permission_mode = mode
+        self.session_store.update(self.state.session)
+
+    def rewind(self) -> None:
+        """Drop messages back to before the last user turn (stub for deeper rewind later)."""
+        if self.state is None or not self.state.messages:
+            return
+        msgs = self.state.messages
+        # Find the last user message and drop from there onward.
+        for i in range(len(msgs) - 1, -1, -1):
+            if msgs[i].role == "user":
+                del msgs[i:]
+                break
+        # Persist the truncated transcript by rewriting transcript.jsonl.
+        sid = self.state.session.id
+        path = self.session_store.session_dir(sid) / "transcript.jsonl"
+        if path.exists():
+            path.write_text(
+                "\n".join(m.model_dump_json() for m in msgs) + ("\n" if msgs else ""),
+                encoding="utf-8",
+            )
+        self.session_store.event_log(sid).write("rewind", {"remaining": len(msgs)})
